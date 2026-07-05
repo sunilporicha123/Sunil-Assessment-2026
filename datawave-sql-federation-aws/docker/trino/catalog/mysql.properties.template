@@ -1,0 +1,9 @@
+# Author: Sunil Poricha - Cloud SRE - Technical Assessment 2026
+# Trino catalog: DB2 (MySQL on Amazon RDS)
+
+connector.name=mysql
+connection-url=jdbc:mysql://${RDS_MYSQL_ENDPOINT}/${RDS_MYSQL_DBNAME}
+connection-user=${RDS_MYSQL_USER}
+connection-password=${RDS_MYSQL_PASSWORD}
+
+case-insensitive-name-matching=true

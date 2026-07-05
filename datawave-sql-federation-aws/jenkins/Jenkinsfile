@@ -1,0 +1,141 @@
+// Author: Sunil Poricha - Cloud SRE - Technical Assessment 2026
+//
+// CI/CD pipeline: lints and plans Terraform, builds/scans the Trino image,
+// pushes to ECR, deploys manifests to EKS, then runs Python smoke tests
+// against the live federation endpoint. Fails fast at every gate.
+
+pipeline {
+  agent { label 'docker-and-aws-cli' }
+
+  environment {
+    AWS_REGION      = 'us-east-1'
+    ECR_REPO        = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/datawave/trino-federation"
+    IMAGE_TAG       = "${env.GIT_COMMIT[0..7]}"
+    EKS_CLUSTER     = 'datawave-federation-eks'
+    K8S_NAMESPACE   = 'sql-federation'
+    TF_WORKDIR      = 'terraform'
+  }
+
+  options {
+    timeout(time: 45, unit: 'MINUTES')
+    disableConcurrentBuilds()
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Static Analysis & Security Scan') {
+      parallel {
+        stage('Terraform fmt/validate') {
+          steps {
+            dir(TF_WORKDIR) {
+              sh 'terraform fmt -check -recursive'
+              sh 'terraform init -backend=false'
+              sh 'terraform validate'
+            }
+          }
+        }
+        stage('tfsec (IaC security scan)') {
+          steps {
+            dir(TF_WORKDIR) {
+              sh 'tfsec . --minimum-severity HIGH'
+            }
+          }
+        }
+        stage('Python lint') {
+          steps {
+            sh 'pip install --quiet -r scripts/requirements.txt flake8'
+            sh 'flake8 scripts/ --max-line-length=100'
+          }
+        }
+        stage('K8s manifest lint (kubeval)') {
+          steps {
+            sh 'kubeval --strict k8s/**/*.yaml'
+          }
+        }
+      }
+    }
+
+    stage('Terraform Plan') {
+      steps {
+        dir(TF_WORKDIR) {
+          sh 'terraform init'
+          sh 'terraform plan -out=tfplan -var-file=terraform.tfvars'
+        }
+      }
+    }
+
+    stage('Approval Gate (prod only)') {
+      when { branch 'main' }
+      steps {
+        input message: 'Apply Terraform plan and deploy to production EKS?', ok: 'Deploy'
+      }
+    }
+
+    stage('Terraform Apply') {
+      steps {
+        dir(TF_WORKDIR) {
+          sh 'terraform apply -auto-approve tfplan'
+        }
+      }
+    }
+
+    stage('Build & Scan Trino Image') {
+      steps {
+        sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} -f docker/trino/Dockerfile docker/trino/"
+        // Fail the build on HIGH/CRITICAL CVEs before anything is pushed
+        sh "trivy image --severity HIGH,CRITICAL --exit-code 1 ${ECR_REPO}:${IMAGE_TAG}"
+      }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        sh 'aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO'
+        sh "docker push ${ECR_REPO}:${IMAGE_TAG}"
+      }
+    }
+
+    stage('Deploy to EKS') {
+      steps {
+        sh 'aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER'
+        sh "sed -i 's|<ECR_REGISTRY>/datawave/trino-federation:latest|${ECR_REPO}:${IMAGE_TAG}|g' k8s/trino/deployment.yaml"
+        sh 'kubectl apply -f k8s/namespace.yaml'
+        sh 'kubectl apply -f k8s/secrets/secrets-template.yaml'
+        sh 'kubectl apply -f k8s/trino/'
+        sh 'kubectl apply -f k8s/ranger/'
+        sh 'kubectl apply -f k8s/elasticsearch/'
+        sh 'kubectl apply -f k8s/metabase/'
+        sh 'kubectl apply -f k8s/ingress.yaml'
+        sh "kubectl rollout status deployment/trino-coordinator -n $K8S_NAMESPACE --timeout=180s"
+        sh "kubectl rollout status deployment/trino-worker -n $K8S_NAMESPACE --timeout=180s"
+        sh "kubectl rollout status deployment/metabase -n $K8S_NAMESPACE --timeout=180s"
+      }
+    }
+
+    stage('Post-Deploy Smoke Tests') {
+      steps {
+        sh 'pip install --quiet -r scripts/requirements.txt'
+        sh 'python3 scripts/health_check.py --namespace $K8S_NAMESPACE'
+        sh 'python3 scripts/setup_catalogs.py --verify-only'
+        sh 'python3 scripts/run_federated_queries.py --smoke-test'
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Deployment ${IMAGE_TAG} succeeded — federation stack healthy."
+    }
+    failure {
+      echo "Pipeline failed — rolling back Trino deployment to previous revision."
+      sh 'kubectl rollout undo deployment/trino-coordinator -n $K8S_NAMESPACE || true'
+      sh 'kubectl rollout undo deployment/trino-worker -n $K8S_NAMESPACE || true'
+    }
+    always {
+      sh 'docker system prune -f || true'
+    }
+  }
+}

@@ -1,0 +1,39 @@
+# Author: Sunil Poricha - Cloud SRE - Technical Assessment 2026
+# Non-secret catalog configuration. Credentials are injected separately via
+# ExternalSecret -> Kubernetes Secret and merged at container start by
+# scripts/setup_catalogs.py (see docker/trino/catalog/*.template).
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-catalogs
+  namespace: sql-federation
+data:
+  postgresql.properties.template: |
+    connector.name=postgresql
+    connection-url=jdbc:postgresql://${RDS_POSTGRES_ENDPOINT}/${RDS_POSTGRES_DBNAME}
+    connection-user=${RDS_POSTGRES_USER}
+    connection-password=${RDS_POSTGRES_PASSWORD}
+    case-insensitive-name-matching=true
+
+  mysql.properties.template: |
+    connector.name=mysql
+    connection-url=jdbc:mysql://${RDS_MYSQL_ENDPOINT}/${RDS_MYSQL_DBNAME}
+    connection-user=${RDS_MYSQL_USER}
+    connection-password=${RDS_MYSQL_PASSWORD}
+    case-insensitive-name-matching=true
+
+  s3_datalake.properties.template: |
+    connector.name=hive
+    hive.metastore=glue
+    hive.metastore.glue.region=${AWS_REGION}
+    hive.non-managed-table-writes-enabled=true
+    hive.s3.sse.enabled=true
+
+  config.properties: |
+    coordinator=true
+    node-scheduler.include-coordinator=true
+    http-server.http.port=8080
+    query.max-memory=4GB
+    query.max-memory-per-node=1GB
+    discovery.uri=http://localhost:8080

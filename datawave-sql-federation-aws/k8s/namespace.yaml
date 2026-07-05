@@ -1,0 +1,8 @@
+# Author: Sunil Poricha - Cloud SRE - Technical Assessment 2026
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sql-federation
+  labels:
+    project: datawave-sql-federation
+    managed-by: terraform-and-jenkins
